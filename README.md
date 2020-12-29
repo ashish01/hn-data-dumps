@@ -8,7 +8,8 @@ Once the initial dataset has been crawled, incremental updates are quite cheap. 
 
 # Getting the data
 
-ZStd compressed SQLite DB can be downloaded from [here](https://www.dropbox.com/sh/alzogzbw9ttc9n3/AACBd-2cXjN-c588qQDztFbPa?dl=0)
+Initially I uploaded these DB snapshots as git-lfs objects but this repo blew past the github bandwidth limits pretty soon. Looking around seems like dropbox will work well for a file of this size.
+ZStd compressed SQLite DB can be downloaded from [here](https://www.dropbox.com/s/9lgekbmxd29a6xv/hn_stories.db3.zst?dl=0)
 
 Once you have downloaded files, decompress the DB
 
