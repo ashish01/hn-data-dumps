@@ -8,22 +8,11 @@ Once the initial dataset has been crawled, incremental updates are quite cheap. 
 
 # Getting the data
 
-All the stories are stored in a compressed SQLite database as a git-lfs object. So getting this working needs a few things - git with LFS support, zstd to decompress the DB and SQLite to read it. So lets install all 3
+ZStd compressed SQLite DB can be downloaded from [here](https://www.dropbox.com/sh/alzogzbw9ttc9n3/AACBd-2cXjN-c588qQDztFbPa?dl=0)
+
+Once you have downloaded files, decompress the DB
 
 ```
-sudo apt-get install git-lfs zstd sqlite3
-```
-
-Now we can clone the repository
-
-```
-git clone https://github.com/ashish01/hn-data-dumps
-```
-
-decompress the DB
-
-```
-cd hn-data-dumps
 zstd -d hn_stories.db3.zst
 ```
 
@@ -32,6 +21,7 @@ and load it in SQLite
 ```
 sqlite3 hn_stories.db3
 ```
+
 
 # Data Schema
 
