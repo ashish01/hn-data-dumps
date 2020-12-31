@@ -6,10 +6,26 @@ Luckily HN has a nice [FireBase API](https://github.com/HackerNews/API) which up
 
 Once the initial dataset has been crawled, incremental updates are quite cheap. There is a small script which runs once a day to download everything since last sync and then uploads a snapshot to this repo, in case anyone else finds it useful as well.
 
-# Getting the data
+# Running the script
 
-Initially I uploaded these DB snapshots as git-lfs objects but this repo blew past the github bandwidth limits pretty soon. Looking around seems like dropbox will work well for a file of this size.
-ZStd compressed SQLite DB can be downloaded from [here](https://www.dropbox.com/s/9lgekbmxd29a6xv/hn_stories.db3.zst?dl=0)
+This script has two dependencies, `tqdm` for reporting progress and `aiohttp` for async http client support. First step is to install them
+
+```
+pip install tqdm aiohttp
+```
+
+After this running the script running is as simple as
+
+```
+python hn_async2.py
+```
+
+This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally in a SQLite database named hn2.db3. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
+
+
+# Getting the stories data
+
+The whole DB is around 13GB uncompressed but its mostly comments. If we limit to titles and urls of stories submitted on HN then its less than 1GB which easily compresses down to 30% of raw size. Daily updated snapshot all HN stories is available [here](https://www.dropbox.com/s/9lgekbmxd29a6xv/hn_stories.db3.zst?dl=0)
 
 Once you have downloaded files, decompress the DB
 
@@ -24,7 +40,7 @@ sqlite3 hn_stories.db3
 ```
 
 
-# Data Schema
+## Data Schema
 
 The schema of the DB is very simple. It only has one table - hn_stories which contains integer ID of the story and its attributes stored as JSON.
 
