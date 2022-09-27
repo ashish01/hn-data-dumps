@@ -5,6 +5,8 @@ import json
 import sqlite3
 import queue
 import threading
+import zstd
+
 
 DB_NAME = "hn2.db3"
 
@@ -12,7 +14,7 @@ DB_NAME = "hn2.db3"
 def create_db(db_name):
     with sqlite3.connect(db_name) as db:
         db.execute(
-            "CREATE TABLE IF NOT EXISTS hn_items(id int PRIMARY KEY, item_json text)"
+            "CREATE TABLE IF NOT EXISTS hn_items(id int PRIMARY KEY, item_json_compressed blob)"
         )
         db.commit()
 
@@ -34,12 +36,17 @@ async def get_max_id():
 
 
 def db_writer_worker(db_name, input_queue):
-    with sqlite3.connect(db_name) as db:
+    with sqlite3.connect(db_name, isolation_level=None) as db:
+        db.execute('pragma journal_mode=wal;')
         while True:
             data = input_queue.get()
             if data is None:
                 break
-            db.execute("insert into hn_items values(?, ?)", data)
+            item, item_json = data
+            item_json_compressed = zstd.compress(item_json.encode("utf8"))
+            db.execute(
+                "insert into hn_items values(?, ?)", (item, item_json_compressed)
+            )
 
 
 async def fetch_and_save(session, db_queue, sem, id):
