@@ -38,6 +38,7 @@ async def get_max_id():
 def db_writer_worker(db_name, input_queue):
     with sqlite3.connect(db_name, isolation_level=None) as db:
         db.execute('pragma journal_mode=wal;')
+        db.execute('pragma synchronous=1;')
         while True:
             data = input_queue.get()
             if data is None:
