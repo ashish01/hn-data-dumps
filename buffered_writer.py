@@ -1,6 +1,6 @@
 from fastparquet import write
 import pandas as pd
-from os import path
+from pathlib import Path
 
 
 class BufferedParquetWriter:
@@ -20,8 +20,11 @@ class BufferedParquetWriter:
         self.flush_to_file()
 
     def flush_to_file(self):
+        path = Path(self.filename)
+        if not path.parent.exists():
+            path.parent.mkdir()
         df = pd.DataFrame(data={"item_id": self.keys, "item_json": self.values})
-        write(self.filename, df, compression="ZSTD", append=path.exists(self.filename))
+        write(path, df, compression="ZSTD", append=path.exists())
         self.keys.clear()
         self.values.clear()
 

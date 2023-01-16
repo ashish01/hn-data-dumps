@@ -5,13 +5,22 @@ import json
 import queue
 import threading
 from buffered_writer import BucketedBufferedParquetWriter
-
+import duckdb
 
 DB_NAME = "data/hn"
 
 
 def get_last_id(db_name):
-    return 1
+    try:
+        with duckdb.connect(database=":memory:") as con:
+            return (
+                con.execute(
+                    f"select max(item_id) from '{db_name}-*.parquet'"
+                ).fetchall()[0][0]
+                + 1
+            )
+    except:
+        return 0
 
 
 async def get_max_id():
@@ -53,6 +62,14 @@ async def run(db_queue):
 
     N = 100
     sem = asyncio.Semaphore(N)
+
+    if last_id > 0:
+        print(
+            "Resuming! If this is not intended then delete the data folder and restart."
+        )
+        print(f"Max item id                     {max_id:,}")
+        print(f"Number of items downloaded      {last_id:,}")
+        print(f"Number of items remaining       {max_id-last_id:,}")
 
     async with aiohttp.ClientSession(
         connector=aiohttp.TCPConnector(ssl=False)
