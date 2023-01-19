@@ -5,22 +5,22 @@ import json
 import queue
 import threading
 from buffered_writer import BucketedBufferedParquetWriter
-import duckdb
+from glob import glob
+from fastparquet import ParquetFile
 
 DB_NAME = "data/hn"
 
 
 def get_last_id(db_name):
-    try:
-        with duckdb.connect(database=":memory:") as con:
-            return (
-                con.execute(
-                    f"select max(item_id) from '{db_name}-*.parquet'"
-                ).fetchall()[0][0]
-                + 1
-            )
-    except:
-        return 0
+    max_id = 0
+    for filename in glob(f"{DB_NAME}*"):
+        f = ParquetFile(filename)
+        for row_grp in f.iter_row_groups():
+            curr = row_grp["item_id"].max()
+            if curr > max_id:
+                max_id = curr
+
+    return max_id
 
 
 async def get_max_id():
