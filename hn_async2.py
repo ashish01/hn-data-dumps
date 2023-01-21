@@ -22,7 +22,6 @@ def get_last_id(db_name):
             if col_max > max_id:
                 max_id = col_max
 
-    print(f"Previous max id is {max_id}")
     return max_id
 
 
