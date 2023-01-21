@@ -6,20 +6,23 @@ import queue
 import threading
 from buffered_writer import BucketedBufferedParquetWriter
 from glob import glob
-from fastparquet import ParquetFile
+import pyarrow.parquet as pq
 
 DB_NAME = "data/hn"
 
 
 def get_last_id(db_name):
     max_id = 0
+    glob(f"{db_name}*")
     for filename in glob(f"{DB_NAME}*"):
-        f = ParquetFile(filename)
-        for row_grp in f.iter_row_groups():
-            curr = row_grp["item_id"].max()
-            if curr > max_id:
-                max_id = curr
+        print(f"Reading {filename} ...", end="\r")
+        metadata = pq.read_metadata(filename)
+        for row_grp in range(metadata.num_row_groups):
+            col_max = metadata.row_group(row_grp).column(0).statistics.max
+            if col_max > max_id:
+                max_id = col_max
 
+    print(f"Previous max id is {max_id}")
     return max_id
 
 
