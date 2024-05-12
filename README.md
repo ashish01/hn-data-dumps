@@ -18,12 +18,12 @@ There is a small script which runs once a day to download everything since last
 sync and then uploads a snapshot to this repo, in case anyone else finds it
 useful as well.
 
-## Running the script
+
+## Running the Script
 
 To create a `venv` and install dependencies (only needs to be done once):
 
 ```
-
 # enter project directory
 cd hn-data-dumps
 
@@ -39,13 +39,11 @@ pip install -r ./requirements.txt
 
 # exit venv
 deactivate
-
 ```
 
 To run the script going forward:
 
 ```
-
 # enter project directory
 cd hn-data-dumps
 
@@ -57,7 +55,6 @@ python hn_async2.py
 
 # exit venv
 deactivate
-
 ```
 
 `hn_async2.py` will start downloading all items sequentially starting with id 1
@@ -73,10 +70,8 @@ The schema of the DB is very simple. It only has one table - `hn_stories` which
 contains integer ID of the story and its attributes stored as JSON.
 
 ```
-
 .schema
 CREATE TABLE hn_stories(id INT PRIMARY KEY, item_json TEXT);
-
 ```
 
 Here is a sample of rows:
