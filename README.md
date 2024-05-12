@@ -1,38 +1,81 @@
 # hn-data-dumps
 
-Hacker News corpus has a few very nice properties. It is small enough that it can be analyzed on a laptop but at the same time it's big and interesting enough to do some non trivial experiments for learning or otherwise. To do any analysis it would be nice to have a copy of HN corpus. Looking around on the web I did find some efforts to have such a copy but each had something missing. [Google BigQuery HN dataset](https://console.cloud.google.com/marketplace/product/y-combinator/hacker-news?filter=solution-type:dataset&q=hacker%20news&id=5227103e-0eb9-4744-872b-325a8df50bee) came the closest but looks like it has not been updated in a while.
+Hacker News corpus has a few very nice properties. It is small enough that it
+can be analyzed on a laptop but at the same time it's big and interesting
+enough to do some non trivial experiments for learning or otherwise. To do any
+analysis it would be nice to have a copy of HN corpus. Looking around on the
+web I did find some efforts to have such a copy but each had something missing.
+[Google BigQuery HN
+dataset](https://console.cloud.google.com/marketplace/product/y-combinator/hacker-news?filter=solution-type:dataset&q=hacker%20news&id=5227103e-0eb9-4744-872b-325a8df50bee)
+came the closest but looks like it has not been updated in a while.
 
-Luckily HN has a nice [FireBase API](https://github.com/HackerNews/API) which updates in real time. So I wrote a (very) small crawler to get all the items starting with id 1 all the way to id 25,562,625 (at the time of this writing).
+Luckily HN has a nice [FireBase API](https://github.com/HackerNews/API) which
+updates in real time. So I wrote a (very) small crawler to get all the items
+starting with id 1 all the way to id 25,562,625 (at the time of this writing).
 
-Once the initial dataset has been crawled, incremental updates are quite cheap. There is a small script which runs once a day to download everything since last sync and then uploads a snapshot to this repo, in case anyone else finds it useful as well.
+Once the initial dataset has been crawled, incremental updates are quite cheap.
+There is a small script which runs once a day to download everything since last
+sync and then uploads a snapshot to this repo, in case anyone else finds it
+useful as well.
 
-# Running the script
+## Running the script
 
-This script has two dependencies, `tqdm` for reporting progress and `aiohttp` for async http client support. First step is to install them
+To create a `venv` and install dependencies (only needs to be done once):
 
 ```
-pip install -r requirements.txt
+# enter project directory
+cd hn-data-dumps
+
+# create new venv
+python3 -m venv .venv
+
+# activate venv
+source .venv/bin/activate
+
+# install dependencies
+python3 -m pip install --upgrade pip
+pip install -r ./requirements.txt
+
+# exit venv
+deactivate
+
 ```
 
-After this running the script running is as simple as
+To run the script going forward:
 
 ```
+# enter project directory
+cd hn-data-dumps
+
+# activate venv
+source .venv/bin/activate
+
+# download data from HN
 python hn_async2.py
+
+# exit venv
+deactivate
 ```
 
-This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally in a SQLite database named hn2.db3. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
+`hn_async2.py` will start downloading all items sequentially starting with id 1
+to the current max from Firebase DB and store them locally in a SQLite database
+named hn2.db3. Once the initial download is finished, which can take a long
+time depending on your computer and network, subsequent runs only download the
+new items created since the last run so they finish quickly.
 
 
 ## Data Schema
 
-The schema of the DB is very simple. It only has one table - hn_stories which contains integer ID of the story and its attributes stored as JSON.
+The schema of the DB is very simple. It only has one table - hn_stories which
+contains integer ID of the story and its attributes stored as JSON.
 
 ```
 .schema
 CREATE TABLE hn_stories(id INT PRIMARY KEY, item_json TEXT);
 ```
 
-Here is a sample of rows
+Here is a sample of rows:
+
 ```
 ┌────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ id │                                                                                           item_json                                                                                           │
