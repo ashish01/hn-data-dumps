@@ -23,6 +23,7 @@ useful as well.
 To create a `venv` and install dependencies (only needs to be done once):
 
 ```
+
 # enter project directory
 cd hn-data-dumps
 
@@ -44,6 +45,7 @@ deactivate
 To run the script going forward:
 
 ```
+
 # enter project directory
 cd hn-data-dumps
 
@@ -55,42 +57,41 @@ python hn_async2.py
 
 # exit venv
 deactivate
+
 ```
 
 `hn_async2.py` will start downloading all items sequentially starting with id 1
 to the current max from Firebase DB and store them locally in a SQLite database
-named hn2.db3. Once the initial download is finished, which can take a long
+named `hn2.db3`. Once the initial download is finished, which can take a long
 time depending on your computer and network, subsequent runs only download the
 new items created since the last run so they finish quickly.
 
 
 ## Data Schema
 
-The schema of the DB is very simple. It only has one table - hn_stories which
+The schema of the DB is very simple. It only has one table - `hn_stories` which
 contains integer ID of the story and its attributes stored as JSON.
 
 ```
+
 .schema
 CREATE TABLE hn_stories(id INT PRIMARY KEY, item_json TEXT);
+
 ```
 
 Here is a sample of rows:
 
-```
-┌────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│ id │                                                                                           item_json                                                                                           │
-├────┼───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┤
-│ 20 │ {"by":"pg","time":1160424038,"title":"Salaries at VC-backed companies","url":"http://avc.blogs.com/a_vc/2006/10/search_by_salar.html"}                                                        │
-│ 4  │ {"by":"onebeerdave","time":1160419662,"title":"NYC Developer Dilemma","url":"http://avc.blogs.com/a_vc/2006/10/the_nyc_develop.html"}                                                         │
-│ 2  │ {"by":"phyllis","time":1160418628,"title":"A Student's Guide to Startups","url":"http://www.paulgraham.com/mit.html"}                                                                         │
-│ 3  │ {"by":"phyllis","time":1160419233,"title":"Woz Interview: the early days of Apple","url":"http://www.foundersatwork.com/stevewozniak.html"}                                                   │
-│ 7  │ {"by":"phyllis","time":1160420455,"title":"Sevin Rosen Unfunds - why?","url":"http://featured.gigaom.com/2006/10/09/sevin-rosen-unfunds-why/"}                                                │
-│ 21 │ {"by":"sama","time":1160443271,"title":"Best IRR ever?  YouTube 1.65B...","url":"http://www.techcrunch.com/2006/10/09/google-has-acquired-youtube/"}                                          │
-│ 9  │ {"by":"askjigga","time":1160421542,"title":"weekendr: social network for the weekend","url":"http://www.weekendr.com/"}                                                                       │
-│ 1  │ {"by":"pg","time":1160418111,"title":"Y Combinator","url":"http://ycombinator.com"}                                                                                                           │
-│ 5  │ {"by":"perler","time":1160419864,"title":"Google, YouTube acquisition announcement could come tonight","url":"http://www.techcrunch.com/2006/10/09/google-youtube-sign-more-separate-deals/"} │
-│ 81 │ {"by":"justin","time":1171869130,"title":"allfreecalls.com shut down by AT&T","url":"http://www.techcrunch.com/2007/02/16/allfreecalls-shut-down/"}                                           │
-└────┴───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
-```
+| id | item_json  |
+| -- | ---------- |
+| 20 | {"by":"pg","time":1160424038,"title":"Salaries at VC-backed companies","url":"http://avc.blogs.com/a_vc/2006/10/search_by_salar.html"}                                                        |
+| 4  | {"by":"onebeerdave","time":1160419662,"title":"NYC Developer Dilemma","url":"http://avc.blogs.com/a_vc/2006/10/the_nyc_develop.html"}                                                         |
+| 2  | {"by":"phyllis","time":1160418628,"title":"A Student's Guide to Startups","url":"http://www.paulgraham.com/mit.html"}                                                                         |
+| 3  | {"by":"phyllis","time":1160419233,"title":"Woz Interview: the early days of Apple","url":"http://www.foundersatwork.com/stevewozniak.html"}                                                   |
+| 7  | {"by":"phyllis","time":1160420455,"title":"Sevin Rosen Unfunds - why?","url":"http://featured.gigaom.com/2006/10/09/sevin-rosen-unfunds-why/"}                                                |
+| 21 | {"by":"sama","time":1160443271,"title":"Best IRR ever?  YouTube 1.65B...","url":"http://www.techcrunch.com/2006/10/09/google-has-acquired-youtube/"}                                          |
+| 9  | {"by":"askjigga","time":1160421542,"title":"weekendr: social network for the weekend","url":"http://www.weekendr.com/"}                                                                       |
+| 1  | {"by":"pg","time":1160418111,"title":"Y Combinator","url":"http://ycombinator.com"}                                                                                                           |
+| 5  | {"by":"perler","time":1160419864,"title":"Google, YouTube acquisition announcement could come tonight","url":"http://www.techcrunch.com/2006/10/09/google-youtube-sign-more-separate-deals/"} |
+| 81 | {"by":"justin","time":1171869130,"title":"allfreecalls.com shut down by AT&T","url":"http://www.techcrunch.com/2007/02/16/allfreecalls-shut-down/"}                                           |
 
 Let me know if you find this useful. Thanks!
