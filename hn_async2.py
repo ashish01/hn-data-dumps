@@ -5,6 +5,7 @@
 #   "fastparquet>=2023.4.0",
 #   "pandas>=2.0.0",
 #   "requests>=2.31.0",
+#   "rich>=13.7.0",
 # ]
 # ///
 """
@@ -15,7 +16,6 @@ import logging
 import queue
 import re
 import signal
-import shutil
 import sys
 import threading
 import time
@@ -26,6 +26,20 @@ from typing import Optional
 import fastparquet
 import pandas as pd
 import requests
+from rich import box
+from rich.console import Console, Group
+from rich.live import Live
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+    TimeRemainingColumn,
+)
+from rich.table import Table
 
 # Configure logging
 logging.basicConfig(
@@ -35,7 +49,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-DB_PATH = Path("data/hn.parquet")
+DATA_DIR = Path("data")
+SHARD_SIZE = 100000
+SHARD_DIGITS = 9
 API_BASE_URL = "https://hacker-news.firebaseio.com/v0"
 WORKER_COUNT = 100
 REQUEST_TIMEOUT = 10  # seconds
@@ -46,16 +62,7 @@ WRITE_QUEUE_SIZE = WORKER_COUNT * 2
 BATCH_SIZE = 1000
 WRITE_FLUSH_SECONDS = 0.5
 REPORT_INTERVAL = 1.0
-
-COLOR_RESET = "\x1b[0m"
-COLOR_DIM = "\x1b[2m"
-COLOR_RED = "\x1b[31m"
-COLOR_GREEN = "\x1b[32m"
-COLOR_YELLOW = "\x1b[33m"
-COLOR_CYAN = "\x1b[36m"
-COLOR_BOLD = "\x1b[1m"
-
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+SHARD_NAME_RE = re.compile(r"^hn-(\d+)-(\d+)\.parquet$")
 
 
 @dataclass
@@ -95,137 +102,157 @@ def snapshot_stats(stats: Stats, lock: threading.Lock) -> Stats:
         )
 
 
-def format_duration(seconds: float) -> str:
-    total = int(seconds)
-    mins, secs = divmod(total, 60)
-    hours, mins = divmod(mins, 60)
-    if hours > 0:
-        return f"{hours:02d}:{mins:02d}:{secs:02d}"
-    return f"{mins:02d}:{secs:02d}"
+def shard_bounds(item_id: int) -> tuple[int, int]:
+    shard_index = (item_id - 1) // SHARD_SIZE
+    start_id = shard_index * SHARD_SIZE + 1
+    end_id = start_id + SHARD_SIZE - 1
+    return start_id, end_id
 
 
-def format_rate(count: int, elapsed: float) -> str:
-    if elapsed <= 0:
-        return "0.0/s"
-    return f"{count / elapsed:.1f}/s"
+def shard_name(start_id: int, end_id: int) -> str:
+    return f"hn-{start_id:0{SHARD_DIGITS}d}-{end_id:0{SHARD_DIGITS}d}.parquet"
 
 
-def format_int(value: int) -> str:
-    return f"{value:,}"
+def shard_path_for_id(data_dir: Path, item_id: int) -> Path:
+    start_id, end_id = shard_bounds(item_id)
+    return data_dir / shard_name(start_id, end_id)
 
 
-def truncate_ansi_line(line: str, max_width: int) -> str:
-    if max_width <= 0:
-        return ""
-    visible = 0
-    i = 0
-    out: list[str] = []
-    while i < len(line) and visible < max_width:
-        if line[i] == "\x1b":
-            match = ANSI_ESCAPE_RE.match(line, i)
-            if match:
-                out.append(match.group(0))
-                i = match.end()
-                continue
-        out.append(line[i])
-        visible += 1
-        i += 1
-    if i < len(line):
-        out.append(COLOR_RESET)
-    return "".join(out)
+def list_shard_files(data_dir: Path) -> list[tuple[int, int, Path]]:
+    if not data_dir.exists():
+        return []
+    shards: list[tuple[int, int, Path]] = []
+    for path in sorted(data_dir.glob("hn-*.parquet")):
+        match = SHARD_NAME_RE.match(path.name)
+        if not match:
+            logger.warning("Ignoring unexpected parquet file: %s", path)
+            continue
+        start_id = int(match.group(1))
+        end_id = int(match.group(2))
+        if start_id <= 0 or end_id < start_id:
+            logger.warning("Ignoring shard with invalid range: %s", path)
+            continue
+        shards.append((start_id, end_id, path))
+    shards.sort(key=lambda entry: entry[0])
+    return shards
 
 
-def render_dashboard(
-    snapshot: Stats,
-    total_target: int,
-    item_queue: queue.Queue,
-    write_queue: queue.Queue,
-    stop_event: threading.Event,
-) -> list[str]:
-    elapsed = time.monotonic() - snapshot.start_time
-    percent = (snapshot.persisted / total_target * 100) if total_target else 100.0
-    bar_width = 28
-    filled = int(bar_width * min(max(percent, 0.0), 100.0) / 100.0)
-    bar = (
-        f"{COLOR_GREEN}{'=' * filled}"
-        f"{COLOR_DIM}{'.' * (bar_width - filled)}{COLOR_RESET}"
-    )
-
-    header = (
-        f"{COLOR_BOLD}HN dump{COLOR_RESET} "
-        f"{COLOR_CYAN}{percent:5.1f}%{COLOR_RESET} "
-        f"[{bar}] "
-        f"{format_int(snapshot.persisted)}/{format_int(total_target)}"
-    )
-
-    stats_line = (
-        f"{COLOR_GREEN}persisted {format_int(snapshot.persisted)}{COLOR_RESET} | "
-        f"{COLOR_CYAN}fetched {format_int(snapshot.fetched)}{COLOR_RESET} | "
-        f"{COLOR_YELLOW}skipped {format_int(snapshot.skipped)}{COLOR_RESET} | "
-        f"{COLOR_RED}fetch_err {format_int(snapshot.fetch_errors)}{COLOR_RESET} | "
-        f"{COLOR_RED}write_err {format_int(snapshot.write_errors)}{COLOR_RESET}"
-    )
-
-    status = (
-        f"rate {format_rate(snapshot.persisted, elapsed)} | "
-        f"retries {format_int(snapshot.retries)} | "
-        f"queues ids {item_queue.qsize():>5} write {write_queue.qsize():>4} | "
-        f"elapsed {format_duration(elapsed)}"
-    )
-    if stop_event.is_set():
-        status += f" | {COLOR_YELLOW}stopping...{COLOR_RESET}"
-
-    return [header, stats_line, status]
+def normalize_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    if not ranges:
+        return []
+    ranges = sorted(ranges, key=lambda entry: entry[0])
+    merged = [ranges[0]]
+    for start_id, end_id in ranges[1:]:
+        last_start, last_end = merged[-1]
+        if start_id <= last_end + 1:
+            merged[-1] = (last_start, max(last_end, end_id))
+        else:
+            merged.append((start_id, end_id))
+    return merged
 
 
-def scan_existing_ids(db_path: Path) -> tuple[int, Optional[bytearray]]:
-    if not db_path.exists():
-        logger.info("No existing parquet file found")
-        return 0, None
-
-    try:
-        parquet = fastparquet.ParquetFile(str(db_path))
-    except Exception as e:
-        logger.error(f"Error opening parquet file {db_path}: {e}")
-        return 0, None
+def scan_existing_ids(
+    data_dir: Path,
+) -> tuple[int, Optional[bytearray], list[tuple[int, int]], list[Path]]:
+    shards = list_shard_files(data_dir)
+    legacy_path = data_dir / "hn.parquet"
+    if not shards:
+        if legacy_path.exists():
+            logger.warning("Legacy file found (not used): %s", legacy_path)
+        logger.info("No existing shard files found")
+        return 0, None, [], []
 
     seen = bytearray(1)
     max_id = 0
+    corrupted_ranges: list[tuple[int, int]] = []
+    corrupted_paths: list[Path] = []
 
-    try:
-        for batch in parquet.iter_row_groups(columns=["item_id"]):
-            if batch.empty:
-                continue
-            ids = batch["item_id"].tolist()
-            if not ids:
-                continue
-            row_max = max(ids)
-            if row_max >= len(seen):
-                new_size = max(row_max + 1, len(seen) * 2)
+    for start_id, end_id, path in shards:
+        try:
+            parquet = fastparquet.ParquetFile(str(path))
+        except Exception as e:
+            logger.error("Error opening shard %s: %s", path, e)
+            corrupted_ranges.append((start_id, end_id))
+            corrupted_paths.append(path)
+            continue
+
+        local_ids: list[int] = []
+        local_max = 0
+        try:
+            for batch in parquet.iter_row_groups(columns=["item_id"]):
+                if batch.empty:
+                    continue
+                ids = batch["item_id"].tolist()
+                if not ids:
+                    continue
+                local_ids.extend(ids)
+                row_max = max(ids)
+                if row_max > local_max:
+                    local_max = row_max
+        except Exception as e:
+            logger.error("Error scanning shard %s: %s", path, e)
+            corrupted_ranges.append((start_id, end_id))
+            corrupted_paths.append(path)
+            continue
+
+        if local_ids:
+            if local_max >= len(seen):
+                new_size = max(local_max + 1, len(seen) * 2)
                 seen.extend(b"\x00" * (new_size - len(seen)))
-            for item_id in ids:
+            for item_id in local_ids:
                 if item_id < 0:
                     continue
                 if item_id >= len(seen):
                     seen.extend(b"\x00" * (item_id + 1 - len(seen)))
                 seen[item_id] = 1
-            if row_max > max_id:
-                max_id = row_max
-    except Exception as e:
-        logger.error(f"Error scanning parquet file {db_path}: {e}")
-        return 0, None
+            if local_max > max_id:
+                max_id = local_max
 
     if max_id + 1 < len(seen):
         seen = seen[: max_id + 1]
 
-    return max_id, seen
+    return max_id, seen, normalize_ranges(corrupted_ranges), corrupted_paths
 
 
-def find_missing_ids(seen: Optional[bytearray], max_id: int) -> list[int]:
+def find_missing_ids(
+    seen: Optional[bytearray],
+    max_id: int,
+    skip_ranges: list[tuple[int, int]],
+) -> list[int]:
     if seen is None or max_id <= 0:
         return []
     limit = min(max_id, len(seen) - 1)
-    return [item_id for item_id in range(1, limit + 1) if seen[item_id] == 0]
+    skip_ranges = normalize_ranges(skip_ranges)
+    missing: list[int] = []
+    range_index = 0
+    current_range = skip_ranges[0] if skip_ranges else None
+    for item_id in range(1, limit + 1):
+        while current_range and item_id > current_range[1]:
+            range_index += 1
+            current_range = (
+                skip_ranges[range_index] if range_index < len(skip_ranges) else None
+            )
+        if current_range and current_range[0] <= item_id <= current_range[1]:
+            continue
+        if seen[item_id] == 0:
+            missing.append(item_id)
+    return missing
+
+
+def count_range_excluding(
+    start_id: int,
+    end_id: int,
+    skip_ranges: list[tuple[int, int]],
+) -> int:
+    if start_id > end_id:
+        return 0
+    total = end_id - start_id + 1
+    for range_start, range_end in normalize_ranges(skip_ranges):
+        overlap_start = max(start_id, range_start)
+        overlap_end = min(end_id, range_end)
+        if overlap_start <= overlap_end:
+            total -= overlap_end - overlap_start + 1
+    return max(0, total)
 
 
 def get_max_id(session: requests.Session) -> int:
@@ -293,32 +320,36 @@ def write_batch(db_path: Path, item_ids: list[int], item_jsons: list[str]) -> No
 
 
 def writer_loop(
-    db_path: Path,
+    data_dir: Path,
     write_queue: queue.Queue,
     stats: Stats,
     stats_lock: threading.Lock,
 ) -> None:
-    batch_ids: list[int] = []
-    batch_jsons: list[str] = []
+    shard_buffers: dict[Path, tuple[list[int], list[str]]] = {}
 
-    def flush_batch() -> None:
-        nonlocal batch_ids, batch_jsons
-        if not batch_ids:
+    def flush_shard(shard_path: Path, item_ids: list[int], item_jsons: list[str]) -> None:
+        if not item_ids:
             return
         try:
-            write_batch(db_path, batch_ids, batch_jsons)
-            add_stats(stats, stats_lock, persisted=len(batch_ids))
+            write_batch(shard_path, item_ids, item_jsons)
+            add_stats(stats, stats_lock, persisted=len(item_ids))
         except Exception as e:
-            add_stats(stats, stats_lock, write_errors=len(batch_ids))
-            logger.error("Error writing batch ending at %s: %s", batch_ids[-1], e)
-        batch_ids = []
-        batch_jsons = []
+            add_stats(stats, stats_lock, write_errors=len(item_ids))
+            logger.error("Error writing shard %s: %s", shard_path, e)
+
+    def flush_all() -> None:
+        nonlocal shard_buffers
+        for shard_path, (item_ids, item_jsons) in list(shard_buffers.items()):
+            if not item_ids:
+                continue
+            flush_shard(shard_path, item_ids, item_jsons)
+            shard_buffers[shard_path] = ([], [])
 
     while True:
         try:
             item = write_queue.get(timeout=WRITE_FLUSH_SECONDS)
         except queue.Empty:
-            flush_batch()
+            flush_all()
             continue
 
         if item is None:
@@ -326,14 +357,19 @@ def writer_loop(
             break
 
         item_id, item_json = item
-        batch_ids.append(item_id)
-        batch_jsons.append(item_json)
+        shard_path = shard_path_for_id(data_dir, item_id)
+        if shard_path not in shard_buffers:
+            shard_buffers[shard_path] = ([], [])
+        shard_ids, shard_jsons = shard_buffers[shard_path]
+        shard_ids.append(item_id)
+        shard_jsons.append(item_json)
         write_queue.task_done()
 
-        if len(batch_ids) >= BATCH_SIZE:
-            flush_batch()
+        if len(shard_ids) >= BATCH_SIZE:
+            flush_shard(shard_path, shard_ids, shard_jsons)
+            shard_buffers[shard_path] = ([], [])
 
-    flush_batch()
+    flush_all()
 
 
 def worker_loop(
@@ -416,6 +452,40 @@ def enqueue_range(
     return True
 
 
+def enqueue_range_excluding(
+    start_id: int,
+    end_id: int,
+    item_queue: queue.Queue,
+    stop_event: threading.Event,
+    skip_ranges: list[tuple[int, int]],
+) -> bool:
+    if start_id > end_id:
+        return True
+    skip_ranges = normalize_ranges(skip_ranges)
+    if not skip_ranges:
+        return enqueue_range(start_id, end_id, item_queue, stop_event)
+    current = start_id
+    for range_start, range_end in skip_ranges:
+        if range_end < current:
+            continue
+        if range_start > end_id:
+            break
+        if range_start > current:
+            if not enqueue_range(
+                current,
+                min(range_start - 1, end_id),
+                item_queue,
+                stop_event,
+            ):
+                return False
+        current = max(current, range_end + 1)
+        if current > end_id:
+            break
+    if current <= end_id:
+        return enqueue_range(current, end_id, item_queue, stop_event)
+    return True
+
+
 def reporter_loop(
     stats: Stats,
     stats_lock: threading.Lock,
@@ -447,41 +517,126 @@ def reporter_loop(
             time.sleep(REPORT_INTERVAL)
         return
 
-    line_count = 3
-    cursor_up = max(line_count - 1, 0)
-    rendered = False
-    sys.stdout.write("\x1b[?25l")
-    sys.stdout.flush()
+    console = Console()
+    progress = Progress(
+        SpinnerColumn(style="cyan"),
+        TextColumn("[bold cyan]{task.description}"),
+        BarColumn(bar_width=None, complete_style="green"),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn(" | "),
+        TimeElapsedColumn(),
+        TextColumn("eta"),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    task_id = progress.add_task("Downloading", total=total_target)
 
-    try:
-        while not done_event.is_set():
+    snapshot = snapshot_stats(stats, stats_lock)
+    elapsed = time.monotonic() - snapshot.start_time
+    rate = snapshot.persisted / elapsed if elapsed > 0 else 0.0
+    progress.update(
+        task_id,
+        completed=snapshot.persisted,
+        description="Stopping" if stop_event.is_set() else "Downloading",
+    )
+    status_table = build_status_table(
+        snapshot,
+        rate,
+        item_queue,
+        write_queue,
+        stop_event.is_set(),
+    )
+    with Live(
+        Group(progress, status_table),
+        console=console,
+        refresh_per_second=10,
+    ) as live:
+        try:
+            while not done_event.is_set():
+                snapshot = snapshot_stats(stats, stats_lock)
+                elapsed = time.monotonic() - snapshot.start_time
+                rate = snapshot.persisted / elapsed if elapsed > 0 else 0.0
+                progress.update(
+                    task_id,
+                    completed=snapshot.persisted,
+                    description="Stopping"
+                    if stop_event.is_set()
+                    else "Downloading",
+                )
+                status_table = build_status_table(
+                    snapshot,
+                    rate,
+                    item_queue,
+                    write_queue,
+                    stop_event.is_set(),
+                )
+                live.update(Group(progress, status_table), refresh=True)
+                time.sleep(REPORT_INTERVAL)
+        finally:
             snapshot = snapshot_stats(stats, stats_lock)
-            lines = render_dashboard(
-                snapshot, total_target, item_queue, write_queue, stop_event
+            elapsed = time.monotonic() - snapshot.start_time
+            rate = snapshot.persisted / elapsed if elapsed > 0 else 0.0
+            progress.update(
+                task_id,
+                completed=snapshot.persisted,
+                description="Done",
             )
-            terminal_width = shutil.get_terminal_size((100, 20)).columns
-            max_width = max(1, terminal_width - 1)
-            lines = [truncate_ansi_line(line, max_width) for line in lines]
+            status_table = build_status_table(
+                snapshot,
+                rate,
+                item_queue,
+                write_queue,
+                stop_event.is_set(),
+            )
+            live.update(Group(progress, status_table), refresh=True)
 
-            if rendered and cursor_up:
-                sys.stdout.write(f"\x1b[{cursor_up}A")
-            for idx, line in enumerate(lines):
-                sys.stdout.write("\r\x1b[2K" + line)
-                if idx < len(lines) - 1:
-                    sys.stdout.write("\n")
-            sys.stdout.flush()
-            rendered = True
-            time.sleep(REPORT_INTERVAL)
-    finally:
-        sys.stdout.write(COLOR_RESET)
-        sys.stdout.write("\x1b[?25h")
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+
+def build_status_table(
+    snapshot: Stats,
+    rate: float,
+    item_queue: queue.Queue,
+    write_queue: queue.Queue,
+    stopping: bool,
+) -> Table:
+    status = "[yellow]stopping[/]" if stopping else "[green]running[/]"
+    fetch_err = (
+        f"[red]{snapshot.fetch_errors:,}[/]" if snapshot.fetch_errors else "0"
+    )
+    write_err = (
+        f"[red]{snapshot.write_errors:,}[/]" if snapshot.write_errors else "0"
+    )
+    table = Table(box=box.SIMPLE, show_header=False, pad_edge=False)
+    table.add_column("metric", style="dim", no_wrap=True)
+    table.add_column("value", justify="right")
+    table.add_column("metric", style="dim", no_wrap=True)
+    table.add_column("value", justify="right")
+    table.add_row("status", status, "rate", f"{rate:,.1f}/s")
+    table.add_row(
+        "persisted",
+        f"{snapshot.persisted:,}",
+        "fetched",
+        f"{snapshot.fetched:,}",
+    )
+    table.add_row(
+        "skipped",
+        f"{snapshot.skipped:,}",
+        "retries",
+        f"{snapshot.retries:,}",
+    )
+    table.add_row("fetch err", fetch_err, "write err", write_err)
+    table.add_row(
+        "id queue",
+        f"{item_queue.qsize():,}",
+        "write queue",
+        f"{write_queue.qsize():,}",
+    )
+    return table
 
 
 def main() -> None:
     start_time = time.time()
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     stop_event = threading.Event()
     report_done = threading.Event()
@@ -500,24 +655,36 @@ def main() -> None:
     stats = Stats()
     stats_lock = threading.Lock()
 
-    last_id, seen = scan_existing_ids(DB_PATH)
+    last_id, seen, corrupted_ranges, corrupted_paths = scan_existing_ids(DATA_DIR)
 
     with requests.Session() as session:
         max_id = get_max_id(session)
 
     scan_limit = min(last_id, max_id)
-    missing_ids = find_missing_ids(seen, scan_limit)
+    missing_ids = find_missing_ids(seen, scan_limit, corrupted_ranges)
     missing_count = len(missing_ids)
-    items_to_download = max(0, max_id - last_id) + missing_count
+    new_range_start = last_id + 1
+    new_count = count_range_excluding(new_range_start, max_id, corrupted_ranges)
+    items_to_download = missing_count + new_count
 
     if last_id > 0:
         logger.info("Highest local ID: %s", f"{last_id:,}")
         logger.info("Max item ID: %s", f"{max_id:,}")
+        if corrupted_paths:
+            logger.error(
+                "Corrupted shard(s) detected (delete to rebuild): %s",
+                ", ".join(str(path) for path in corrupted_paths),
+            )
         if missing_count:
             logger.info("Missing IDs to backfill: %s", f"{missing_count:,}")
         logger.info("Items to download: %s", f"{items_to_download:,}")
     else:
         logger.info("Starting fresh download of %s items", f"{max_id:,}")
+        if corrupted_paths:
+            logger.error(
+                "Corrupted shard(s) detected (delete to rebuild): %s",
+                ", ".join(str(path) for path in corrupted_paths),
+            )
 
     if items_to_download <= 0:
         logger.info("No new items to download")
@@ -528,7 +695,7 @@ def main() -> None:
 
     writer_thread = threading.Thread(
         target=writer_loop,
-        args=(DB_PATH, write_queue, stats, stats_lock),
+        args=(DATA_DIR, write_queue, stats, stats_lock),
         name="writer",
     )
     writer_thread.start()
@@ -568,7 +735,13 @@ def main() -> None:
 
     try:
         if enqueue_ids(missing_ids, item_queue, stop_event):
-            enqueue_range(last_id + 1, max_id, item_queue, stop_event)
+            enqueue_range_excluding(
+                last_id + 1,
+                max_id,
+                item_queue,
+                stop_event,
+                corrupted_ranges,
+            )
     finally:
         if stop_event.is_set():
             dropped = 0

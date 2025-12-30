@@ -21,23 +21,25 @@ chmod +x hn_async2.py
 ./hn_async2.py
 ```
 
-This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally as a Parquet file under `data/`. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
+This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally as sharded Parquet files under `data/`. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
 
 
 ## Data Schema
 
-Each Parquet file contains two columns:
+Each Parquet shard contains two columns:
 
 - `item_id` (integer)
 - `item_json` (JSON string)
 
-The data is written to `data/hn.parquet`.
+The data is written to `data/hn-000000001-000100000.parquet`, `data/hn-000100001-000200000.parquet`, etc.
 
 You can read the Parquet file directly with [DuckDB](https://duckdb.org/). For example, group by item type:
 
 ```
-duckdb -c "SELECT json_extract_string(item_json, '\$.type') AS type, COUNT(*) AS count FROM 'data/hn.parquet' GROUP BY 1 ORDER BY 2 DESC;"
+duckdb -c "SELECT json_extract_string(item_json, '\$.type') AS type, COUNT(*) AS count FROM 'data/hn-*.parquet' GROUP BY 1 ORDER BY 2 DESC;"
 ```
+
+If a shard is corrupted, the script will report the shard filename; delete it and re-run to rebuild that range.
 
 Here is a sample of rows:
 ```
