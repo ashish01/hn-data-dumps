@@ -8,31 +8,32 @@ Once the initial dataset has been crawled, incremental updates are quite cheap. 
 
 # Running the script
 
-This script has two dependencies, `tqdm` for reporting progress and `aiohttp` for async http client support. First step is to install them
+This script is meant to be run with [uv](https://github.com/astral-sh/uv). Dependencies are embedded in the script via PEP 723 metadata.
 
 ```
-pip install -r requirements.txt
+uv run --script hn_async2.py
 ```
 
-After this running the script running is as simple as
+If you want it to behave like a standalone executable:
 
 ```
-python hn_async2.py
+chmod +x hn_async2.py
+./hn_async2.py
 ```
 
-This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally in a SQLite database named hn2.db3. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
+This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally as bucketed Parquet files under `data/`. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
 
 
 ## Data Schema
 
-The schema of the DB is very simple. It only has one table - hn_stories which contains integer ID of the story and its attributes stored as JSON.
+Each Parquet file contains two columns:
 
-```
-.schema
-CREATE TABLE hn_stories(id INT PRIMARY KEY, item_json TEXT);
-```
+- `item_id` (integer)
+- `item_json` (JSON string)
 
-Here is a sample of rows
+The files are written to `data/` with names like `hn-0000.parquet`, `hn-0001.parquet`, etc.
+
+Here is a sample of rows:
 ```
 ┌────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
 │ id │                                                                                           item_json                                                                                           │
