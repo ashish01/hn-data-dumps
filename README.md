@@ -33,6 +33,12 @@ Each Parquet file contains two columns:
 
 The data is written to `data/hn.parquet`.
 
+You can read the Parquet file directly with [DuckDB](https://duckdb.org/). For example, group by item type:
+
+```
+duckdb -c "SELECT json_extract_string(item_json, '\$.type') AS type, COUNT(*) AS count FROM 'data/hn.parquet' GROUP BY 1 ORDER BY 2 DESC;"
+```
+
 Here is a sample of rows:
 ```
 ┌────┬───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
