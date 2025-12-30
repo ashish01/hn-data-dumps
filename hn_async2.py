@@ -2,31 +2,30 @@
 # /// script
 # requires-python = ">=3.9"
 # dependencies = [
-#   "aiohttp>=3.8.0",
-#   "pyarrow>=12.0.0",
 #   "fastparquet>=2023.4.0",
 #   "pandas>=2.0.0",
+#   "requests>=2.31.0",
 # ]
 # ///
 """
-Hacker News Data Dumper - Efficiently downloads and stores all Hacker News items.
+Hacker News Data Dumper - downloads and stores all Hacker News items.
 """
-import asyncio
 import json
 import logging
-import os
+import queue
 import re
+import signal
 import shutil
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-import aiohttp
-import pyarrow.parquet as pq
-
-from buffered_writer import BucketedBufferedParquetWriter
+import fastparquet
+import pandas as pd
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -36,7 +35,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Constants
-DB_NAME = "data/hn"
+DB_PATH = Path("data/hn.parquet")
 API_BASE_URL = "https://hacker-news.firebaseio.com/v0"
 WORKER_COUNT = 100
 REQUEST_TIMEOUT = 10  # seconds
@@ -44,16 +43,9 @@ RETRY_ATTEMPTS = 3
 RETRY_DELAY = 1  # seconds
 QUEUE_SIZE = 10000
 WRITE_QUEUE_SIZE = WORKER_COUNT * 2
-UI_REFRESH_SECONDS = 0.15
-PERSIST_FLASH_SECONDS = 0.6
-ERROR_FLASH_SECONDS = 1.0
-UI_WORKERS_PER_ROW = 10
-
-STATE_IDLE = "idle"
-STATE_FETCHING = "fetch"
-STATE_QUEUED = "queued"
-STATE_SKIPPED = "skipped"
-STATE_ERROR = "error"
+BATCH_SIZE = 1000
+WRITE_FLUSH_SECONDS = 0.5
+REPORT_INTERVAL = 1.0
 
 COLOR_RESET = "\x1b[0m"
 COLOR_DIM = "\x1b[2m"
@@ -65,211 +57,42 @@ COLOR_BOLD = "\x1b[1m"
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
-STATE_COLORS = {
-    STATE_IDLE: COLOR_DIM,
-    STATE_FETCHING: COLOR_YELLOW,
-    STATE_QUEUED: COLOR_CYAN,
-    STATE_SKIPPED: COLOR_YELLOW,
-    STATE_ERROR: COLOR_RED,
-}
-STATE_SHORT_LABELS = {
-    STATE_IDLE: "i",
-    STATE_FETCHING: "f",
-    STATE_QUEUED: "q",
-    STATE_SKIPPED: "s",
-    STATE_ERROR: "e",
-}
-
 
 @dataclass
-class WorkerStatus:
-    state: str = STATE_IDLE
-    item_id: Optional[int] = None
-    retries: int = 0
-    last_latency_ms: float = 0.0
-    last_persisted_id: Optional[int] = None
-    last_persisted_at: float = 0.0
-    last_error_at: float = 0.0
-    downloaded: int = 0
-
-
-@dataclass
-class Metrics:
+class Stats:
     start_time: float = field(default_factory=time.monotonic)
-    completed: int = 0
+    fetched: int = 0
     persisted: int = 0
     skipped: int = 0
-    errors: int = 0
+    fetch_errors: int = 0
+    write_errors: int = 0
     retries: int = 0
 
 
-def get_last_id(db_name: str) -> int:
-    """
-    Find the highest item ID that has been stored in parquet files.
-    
-    Args:
-        db_name: Base name of the database files
-        
-    Returns:
-        The highest item ID found, or 0 if no files exist
-    """
-    max_id = 0
-    file_pattern = f"{db_name}*.parquet"
-    
-    try:
-        files = list(Path().glob(file_pattern))
-        if not files:
-            logger.info(f"No existing files found with pattern {file_pattern}")
-            return 0
-            
-        logger.info(f"Found {len(files)} database files")
-        
-        for filename in files:
-            try:
-                logger.debug(f"Reading metadata from {filename}")
-                metadata = pq.read_metadata(str(filename))
-                for row_grp in range(metadata.num_row_groups):
-                    stats = metadata.row_group(row_grp).column(0).statistics
-                    if stats is None or stats.max is None:
-                        continue
-                    if stats.max > max_id:
-                        max_id = stats.max
-            except Exception as e:
-                logger.error(f"Error reading metadata from {filename}: {e}")
-    except Exception as e:
-        logger.error(f"Error finding last ID: {e}")
-        
-    return max_id
+@dataclass
+class FetchResult:
+    item_json: Optional[str]
+    retries: int
+    not_found: bool = False
 
 
-async def get_max_id(session: aiohttp.ClientSession) -> int:
-    """
-    Get the current maximum item ID from the Hacker News API.
-    
-    Args:
-        session: The aiohttp ClientSession to use for the request
-        
-    Returns:
-        The current maximum item ID
-        
-    Raises:
-        ValueError: If the API response is invalid
-    """
-    max_id_url = f"{API_BASE_URL}/maxitem.json"
-    
-    for attempt in range(RETRY_ATTEMPTS):
-        try:
-            async with session.get(max_id_url, timeout=REQUEST_TIMEOUT) as response:
-                if response.status != 200:
-                    logger.warning(f"Got status {response.status} from API, retrying...")
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
-                    
-                text = await response.text()
-                max_id = json.loads(text)
-                
-                if not isinstance(max_id, int) or max_id <= 0:
-                    raise ValueError(f"Invalid max ID returned from API: {max_id}")
-                    
-                return max_id
-                
-        except asyncio.TimeoutError:
-            logger.warning(f"Timeout getting max ID (attempt {attempt+1})")
-        except Exception as e:
-            logger.warning(f"Error getting max ID (attempt {attempt+1}): {e}")
-            
-        # Wait before retrying
-        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-    
-    # If we get here, all attempts failed
-    raise RuntimeError("Failed to get max ID after multiple attempts")
+def add_stats(stats: Stats, lock: threading.Lock, **updates: int) -> None:
+    with lock:
+        for key, value in updates.items():
+            setattr(stats, key, getattr(stats, key) + value)
 
 
-async def db_writer_worker(
-    db_name: str,
-    input_queue: asyncio.Queue,
-    buffer_size: int = 1000
-) -> None:
-    """
-    Async worker that writes items to parquet files using a background thread.
-    
-    Args:
-        db_name: Base name for the database files
-        input_queue: Queue receiving (item_id, item_json, ack_future) tuples
-        buffer_size: Number of items to buffer before writing
-    """
-    logger.info(f"Starting database writer with buffer size {buffer_size}")
-    db = BucketedBufferedParquetWriter(db_name, buffer_size=buffer_size)
-    try:
-        while True:
-            data = await input_queue.get()
-            try:
-                # None is the signal to exit
-                if data is None:
-                    logger.info("Received exit signal, closing database")
-                    break
-
-                item_id, item_json, ack = data
-                ok = True
-                try:
-                    await asyncio.to_thread(db.add, item_id, item_json)
-                except Exception as e:
-                    ok = False
-                    logger.error(f"Error writing item {item_id}: {e}")
-                if not ack.done():
-                    ack.set_result(ok)
-            except Exception as e:
-                logger.error(f"Error in database writer: {e}")
-            finally:
-                input_queue.task_done()
-    except Exception as e:
-        logger.critical(f"Fatal error in database writer: {e}")
-    finally:
-        await asyncio.to_thread(db.close)
-
-
-async def fetch_item(
-    session: aiohttp.ClientSession, 
-    item_id: int,
-    retry_attempts: int = RETRY_ATTEMPTS
-) -> tuple[str, int]:
-    """
-    Fetch a single item from the Hacker News API.
-    
-    Args:
-        session: The aiohttp ClientSession to use
-        item_id: The ID of the item to fetch
-        retry_attempts: Number of retry attempts for failed requests
-        
-    Returns:
-        Tuple of JSON string (or "null") and retry count
-    """
-    url = f"{API_BASE_URL}/item/{item_id}.json"
-    
-    for attempt in range(retry_attempts):
-        try:
-            async with session.get(url, timeout=REQUEST_TIMEOUT) as response:
-                if response.status == 404:
-                    # Item doesn't exist
-                    return "null", attempt
-                elif response.status != 200:
-                    logger.debug(f"Got status {response.status} for item {item_id}, retrying...")
-                    await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
-                
-                return await response.text(), attempt
-                
-        except asyncio.TimeoutError:
-            logger.debug(f"Timeout fetching item {item_id} (attempt {attempt+1})")
-        except Exception as e:
-            logger.debug(f"Error fetching item {item_id} (attempt {attempt+1}): {e}")
-        
-        # Wait before retrying
-        await asyncio.sleep(RETRY_DELAY * (attempt + 1))
-    
-    # If all retries failed, return null to skip this item
-    logger.warning(f"Failed to fetch item {item_id} after {retry_attempts} attempts")
-    return "null", retry_attempts
+def snapshot_stats(stats: Stats, lock: threading.Lock) -> Stats:
+    with lock:
+        return Stats(
+            start_time=stats.start_time,
+            fetched=stats.fetched,
+            persisted=stats.persisted,
+            skipped=stats.skipped,
+            fetch_errors=stats.fetch_errors,
+            write_errors=stats.write_errors,
+            retries=stats.retries,
+        )
 
 
 def format_duration(seconds: float) -> str:
@@ -289,134 +112,6 @@ def format_rate(count: int, elapsed: float) -> str:
 
 def format_int(value: int) -> str:
     return f"{value:,}"
-
-
-def format_worker_line(index: int, status: WorkerStatus, now: float) -> str:
-    flash_persist = now - status.last_persisted_at < PERSIST_FLASH_SECONDS
-    flash_error = now - status.last_error_at < ERROR_FLASH_SECONDS
-
-    if flash_error:
-        color = COLOR_RED
-        state_label = "error"
-        item_id = status.item_id
-    elif flash_persist:
-        color = COLOR_GREEN
-        state_label = "persisted"
-        item_id = status.last_persisted_id
-    else:
-        color = STATE_COLORS.get(status.state, COLOR_RESET)
-        state_label = status.state
-        item_id = status.item_id
-
-    item_str = f"{item_id}" if item_id is not None else "-"
-    latency = f"{status.last_latency_ms:4.0f}ms" if status.last_latency_ms else "  --"
-    return (
-        f"{color}W{index:02d} {state_label:<9} "
-        f"id={item_str:<9} r={status.retries:<2} {latency:>6}"
-        f"{COLOR_RESET}"
-    )
-
-
-def format_worker_token(index: int, status: WorkerStatus, now: float) -> str:
-    flash_persist = now - status.last_persisted_at < PERSIST_FLASH_SECONDS
-    flash_error = now - status.last_error_at < ERROR_FLASH_SECONDS
-
-    if flash_error:
-        color = COLOR_RED
-        state_label = "e"
-        item_id = status.item_id
-    elif flash_persist:
-        color = COLOR_GREEN
-        state_label = "p"
-        item_id = status.last_persisted_id
-    else:
-        color = STATE_COLORS.get(status.state, COLOR_RESET)
-        state_label = STATE_SHORT_LABELS.get(status.state, "?")
-        item_id = status.item_id
-
-    item_str = f"{item_id}" if item_id is not None else "-"
-    return f"{color}{index:02d}{state_label}:{item_str:>9}{COLOR_RESET}"
-
-
-def format_worker_group_summary(group: list[WorkerStatus]) -> str:
-    counts = {
-        STATE_IDLE: 0,
-        STATE_FETCHING: 0,
-        STATE_QUEUED: 0,
-        STATE_SKIPPED: 0,
-        STATE_ERROR: 0,
-    }
-    for status in group:
-        counts[status.state] = counts.get(status.state, 0) + 1
-
-    downloaded = sum(status.downloaded for status in group)
-    return " ".join(
-        [
-            f"{COLOR_DIM}idle={counts[STATE_IDLE]:02d}{COLOR_RESET}",
-            f"{COLOR_YELLOW}fetch={counts[STATE_FETCHING]:02d}{COLOR_RESET}",
-            f"{COLOR_CYAN}queued={counts[STATE_QUEUED]:02d}{COLOR_RESET}",
-            f"{COLOR_YELLOW}skipped={counts[STATE_SKIPPED]:02d}{COLOR_RESET}",
-            f"{COLOR_RED}error={counts[STATE_ERROR]:02d}{COLOR_RESET}",
-            f"{COLOR_GREEN}downloaded={format_int(downloaded)}{COLOR_RESET}",
-        ]
-    )
-
-
-def get_worker_groups(
-    statuses: list[WorkerStatus],
-    group_size: int
-) -> list[tuple[int, list[WorkerStatus]]]:
-    total = len(statuses)
-    if total == 0 or group_size <= 0:
-        return []
-    groups = []
-    for start in range(0, total, group_size):
-        end = min(start + group_size, total)
-        groups.append((start, statuses[start:end]))
-    return groups
-
-
-def render_dashboard(
-    statuses: list[WorkerStatus],
-    metrics: Metrics,
-    item_queue: asyncio.Queue,
-    write_queue: asyncio.Queue,
-    items_total: int,
-    max_id: int
-) -> list[str]:
-    now = time.monotonic()
-    elapsed = now - metrics.start_time
-    completed = metrics.completed
-    percent = (completed / items_total * 100) if items_total else 100.0
-    busy = sum(1 for s in statuses if s.state != STATE_IDLE)
-
-    header = (
-        f"{COLOR_BOLD}HN dump{COLOR_RESET} "
-        f"{COLOR_CYAN}{percent:5.1f}%{COLOR_RESET} "
-        f"{format_int(completed)}/{format_int(items_total)} | "
-        f"{COLOR_GREEN}persisted {format_int(metrics.persisted)}{COLOR_RESET} | "
-        f"{COLOR_YELLOW}skipped {format_int(metrics.skipped)}{COLOR_RESET} | "
-        f"{COLOR_RED}errors {format_int(metrics.errors)}{COLOR_RESET} | "
-        f"{COLOR_YELLOW}retries {format_int(metrics.retries)}{COLOR_RESET} | "
-        f"{COLOR_CYAN}rate {format_rate(completed, elapsed)}{COLOR_RESET} | "
-        f"{COLOR_DIM}elapsed {format_duration(elapsed)}{COLOR_RESET}"
-    )
-    queues = (
-        f"queues: ids {item_queue.qsize():>5} write {write_queue.qsize():>3} | "
-        f"workers busy {busy}/{len(statuses)} | max_id {format_int(max_id)}"
-    )
-
-    lines: list[str] = []
-    groups = get_worker_groups(statuses, UI_WORKERS_PER_ROW)
-    for start, group in groups:
-        end = start + len(group) - 1
-        label = f"W{start:02d}-{end:02d}"
-        summary = format_worker_group_summary(group)
-        lines.append(f"{COLOR_BOLD}{label}{COLOR_RESET} {summary}")
-    lines.append("")
-    lines.append(header)
-    lines.append(queues)
-    return lines
 
 
 def truncate_ansi_line(line: str, max_width: int) -> str:
@@ -440,47 +135,343 @@ def truncate_ansi_line(line: str, max_width: int) -> str:
     return "".join(out)
 
 
-async def ui_loop(
-    statuses: list[WorkerStatus],
-    metrics: Metrics,
-    item_queue: asyncio.Queue,
-    write_queue: asyncio.Queue,
-    items_total: int,
-    max_id: int,
-    stop_event: asyncio.Event
+def render_dashboard(
+    snapshot: Stats,
+    total_target: int,
+    item_queue: queue.Queue,
+    write_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> list[str]:
+    elapsed = time.monotonic() - snapshot.start_time
+    percent = (snapshot.persisted / total_target * 100) if total_target else 100.0
+    bar_width = 28
+    filled = int(bar_width * min(max(percent, 0.0), 100.0) / 100.0)
+    bar = (
+        f"{COLOR_GREEN}{'=' * filled}"
+        f"{COLOR_DIM}{'.' * (bar_width - filled)}{COLOR_RESET}"
+    )
+
+    header = (
+        f"{COLOR_BOLD}HN dump{COLOR_RESET} "
+        f"{COLOR_CYAN}{percent:5.1f}%{COLOR_RESET} "
+        f"[{bar}] "
+        f"{format_int(snapshot.persisted)}/{format_int(total_target)}"
+    )
+
+    stats_line = (
+        f"{COLOR_GREEN}persisted {format_int(snapshot.persisted)}{COLOR_RESET} | "
+        f"{COLOR_CYAN}fetched {format_int(snapshot.fetched)}{COLOR_RESET} | "
+        f"{COLOR_YELLOW}skipped {format_int(snapshot.skipped)}{COLOR_RESET} | "
+        f"{COLOR_RED}fetch_err {format_int(snapshot.fetch_errors)}{COLOR_RESET} | "
+        f"{COLOR_RED}write_err {format_int(snapshot.write_errors)}{COLOR_RESET}"
+    )
+
+    status = (
+        f"rate {format_rate(snapshot.persisted, elapsed)} | "
+        f"retries {format_int(snapshot.retries)} | "
+        f"queues ids {item_queue.qsize():>5} write {write_queue.qsize():>4} | "
+        f"elapsed {format_duration(elapsed)}"
+    )
+    if stop_event.is_set():
+        status += f" | {COLOR_YELLOW}stopping...{COLOR_RESET}"
+
+    return [header, stats_line, status]
+
+
+def scan_existing_ids(db_path: Path) -> tuple[int, Optional[bytearray]]:
+    if not db_path.exists():
+        logger.info("No existing parquet file found")
+        return 0, None
+
+    try:
+        parquet = fastparquet.ParquetFile(str(db_path))
+    except Exception as e:
+        logger.error(f"Error opening parquet file {db_path}: {e}")
+        return 0, None
+
+    seen = bytearray(1)
+    max_id = 0
+
+    try:
+        for batch in parquet.iter_row_groups(columns=["item_id"]):
+            if batch.empty:
+                continue
+            ids = batch["item_id"].tolist()
+            if not ids:
+                continue
+            row_max = max(ids)
+            if row_max >= len(seen):
+                new_size = max(row_max + 1, len(seen) * 2)
+                seen.extend(b"\x00" * (new_size - len(seen)))
+            for item_id in ids:
+                if item_id < 0:
+                    continue
+                if item_id >= len(seen):
+                    seen.extend(b"\x00" * (item_id + 1 - len(seen)))
+                seen[item_id] = 1
+            if row_max > max_id:
+                max_id = row_max
+    except Exception as e:
+        logger.error(f"Error scanning parquet file {db_path}: {e}")
+        return 0, None
+
+    if max_id + 1 < len(seen):
+        seen = seen[: max_id + 1]
+
+    return max_id, seen
+
+
+def find_missing_ids(seen: Optional[bytearray], max_id: int) -> list[int]:
+    if seen is None or max_id <= 0:
+        return []
+    limit = min(max_id, len(seen) - 1)
+    return [item_id for item_id in range(1, limit + 1) if seen[item_id] == 0]
+
+
+def get_max_id(session: requests.Session) -> int:
+    max_id_url = f"{API_BASE_URL}/maxitem.json"
+
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            response = session.get(max_id_url, timeout=REQUEST_TIMEOUT)
+            if response.status_code != 200:
+                logger.warning(
+                    "Got status %s from API, retrying...",
+                    response.status_code,
+                )
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+
+            max_id = json.loads(response.text)
+            if not isinstance(max_id, int) or max_id <= 0:
+                raise ValueError(f"Invalid max ID returned from API: {max_id}")
+
+            return max_id
+        except (requests.RequestException, ValueError) as e:
+            logger.warning("Error getting max ID (attempt %s): %s", attempt + 1, e)
+        time.sleep(RETRY_DELAY * (attempt + 1))
+
+    raise RuntimeError("Failed to get max ID after multiple attempts")
+
+
+def fetch_item(session: requests.Session, item_id: int) -> FetchResult:
+    url = f"{API_BASE_URL}/item/{item_id}.json"
+
+    for attempt in range(RETRY_ATTEMPTS):
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 404:
+                return FetchResult("null", attempt, True)
+            if response.status_code != 200:
+                logger.debug(
+                    "Got status %s for item %s, retrying...",
+                    response.status_code,
+                    item_id,
+                )
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+
+            return FetchResult(response.text, attempt, False)
+        except requests.RequestException as e:
+            logger.debug(
+                "Error fetching item %s (attempt %s): %s",
+                item_id,
+                attempt + 1,
+                e,
+            )
+        time.sleep(RETRY_DELAY * (attempt + 1))
+
+    logger.warning("Failed to fetch item %s after %s attempts", item_id, RETRY_ATTEMPTS)
+    return FetchResult(None, RETRY_ATTEMPTS, False)
+
+
+def write_batch(db_path: Path, item_ids: list[int], item_jsons: list[str]) -> None:
+    if not item_ids:
+        return
+    frame = pd.DataFrame({"item_id": item_ids, "item_json": item_jsons})
+    fastparquet.write(str(db_path), frame, compression="ZSTD", append=db_path.exists())
+
+
+def writer_loop(
+    db_path: Path,
+    write_queue: queue.Queue,
+    stats: Stats,
+    stats_lock: threading.Lock,
+) -> None:
+    batch_ids: list[int] = []
+    batch_jsons: list[str] = []
+
+    def flush_batch() -> None:
+        nonlocal batch_ids, batch_jsons
+        if not batch_ids:
+            return
+        try:
+            write_batch(db_path, batch_ids, batch_jsons)
+            add_stats(stats, stats_lock, persisted=len(batch_ids))
+        except Exception as e:
+            add_stats(stats, stats_lock, write_errors=len(batch_ids))
+            logger.error("Error writing batch ending at %s: %s", batch_ids[-1], e)
+        batch_ids = []
+        batch_jsons = []
+
+    while True:
+        try:
+            item = write_queue.get(timeout=WRITE_FLUSH_SECONDS)
+        except queue.Empty:
+            flush_batch()
+            continue
+
+        if item is None:
+            write_queue.task_done()
+            break
+
+        item_id, item_json = item
+        batch_ids.append(item_id)
+        batch_jsons.append(item_json)
+        write_queue.task_done()
+
+        if len(batch_ids) >= BATCH_SIZE:
+            flush_batch()
+
+    flush_batch()
+
+
+def worker_loop(
+    worker_id: int,
+    item_queue: queue.Queue,
+    write_queue: queue.Queue,
+    stats: Stats,
+    stats_lock: threading.Lock,
+    stop_event: threading.Event,
+) -> None:
+    session = requests.Session()
+    while True:
+        try:
+            item_id = item_queue.get(timeout=0.5)
+        except queue.Empty:
+            if stop_event.is_set():
+                break
+            continue
+
+        if item_id is None:
+            item_queue.task_done()
+            break
+
+        if stop_event.is_set():
+            item_queue.task_done()
+            break
+
+        result = fetch_item(session, item_id)
+        add_stats(stats, stats_lock, retries=result.retries)
+
+        if result.item_json is None:
+            add_stats(stats, stats_lock, fetch_errors=1)
+        else:
+            if result.not_found:
+                add_stats(stats, stats_lock, skipped=1)
+            add_stats(stats, stats_lock, fetched=1)
+            write_queue.put((item_id, result.item_json))
+
+        item_queue.task_done()
+
+        if stop_event.is_set():
+            break
+
+    session.close()
+    logger.debug("Worker %s exiting", worker_id)
+
+
+def enqueue_ids(
+    ids: list[int],
+    item_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> bool:
+    for item_id in ids:
+        while True:
+            if stop_event.is_set():
+                return False
+            try:
+                item_queue.put(item_id, timeout=0.5)
+                break
+            except queue.Full:
+                continue
+    return True
+
+
+def enqueue_range(
+    start_id: int,
+    end_id: int,
+    item_queue: queue.Queue,
+    stop_event: threading.Event,
+) -> bool:
+    for item_id in range(start_id, end_id + 1):
+        while True:
+            if stop_event.is_set():
+                return False
+            try:
+                item_queue.put(item_id, timeout=0.5)
+                break
+            except queue.Full:
+                continue
+    return True
+
+
+def reporter_loop(
+    stats: Stats,
+    stats_lock: threading.Lock,
+    item_queue: queue.Queue,
+    write_queue: queue.Queue,
+    total_target: int,
+    stop_event: threading.Event,
+    done_event: threading.Event,
 ) -> None:
     if not sys.stdout.isatty():
+        while not done_event.is_set():
+            snapshot = snapshot_stats(stats, stats_lock)
+            elapsed = time.monotonic() - snapshot.start_time
+            rate = snapshot.persisted / elapsed if elapsed > 0 else 0.0
+            logger.info(
+                "progress persisted=%s/%s fetched=%s skipped=%s fetch_errors=%s "
+                "write_errors=%s retries=%s rate=%.1f/s queues ids=%s write=%s",
+                snapshot.persisted,
+                total_target,
+                snapshot.fetched,
+                snapshot.skipped,
+                snapshot.fetch_errors,
+                snapshot.write_errors,
+                snapshot.retries,
+                rate,
+                item_queue.qsize(),
+                write_queue.qsize(),
+            )
+            time.sleep(REPORT_INTERVAL)
         return
 
-    line_count = 3 + len(get_worker_groups(statuses, UI_WORKERS_PER_ROW))
+    line_count = 3
     cursor_up = max(line_count - 1, 0)
     rendered = False
     sys.stdout.write("\x1b[?25l")
     sys.stdout.flush()
 
     try:
-        while not stop_event.is_set():
+        while not done_event.is_set():
+            snapshot = snapshot_stats(stats, stats_lock)
             lines = render_dashboard(
-                statuses,
-                metrics,
-                item_queue,
-                write_queue,
-                items_total,
-                max_id
+                snapshot, total_target, item_queue, write_queue, stop_event
             )
-            terminal_width = shutil.get_terminal_size((80, 20)).columns
+            terminal_width = shutil.get_terminal_size((100, 20)).columns
             max_width = max(1, terminal_width - 1)
             lines = [truncate_ansi_line(line, max_width) for line in lines]
-            if rendered:
-                if cursor_up:
-                    sys.stdout.write(f"\x1b[{cursor_up}A")
+
+            if rendered and cursor_up:
+                sys.stdout.write(f"\x1b[{cursor_up}A")
             for idx, line in enumerate(lines):
                 sys.stdout.write("\r\x1b[2K" + line)
                 if idx < len(lines) - 1:
                     sys.stdout.write("\n")
             sys.stdout.flush()
             rendered = True
-            await asyncio.sleep(UI_REFRESH_SECONDS)
+            time.sleep(REPORT_INTERVAL)
     finally:
         sys.stdout.write(COLOR_RESET)
         sys.stdout.write("\x1b[?25h")
@@ -488,178 +479,145 @@ async def ui_loop(
         sys.stdout.flush()
 
 
-async def worker_loop(
-    worker_id: int,
-    session: aiohttp.ClientSession,
-    item_queue: asyncio.Queue,
-    write_queue: asyncio.Queue,
-    status: WorkerStatus,
-    metrics: Metrics
-) -> None:
-    while True:
-        item_id = await item_queue.get()
-        try:
-            if item_id is None:
-                status.state = STATE_IDLE
-                break
-
-            status.state = STATE_FETCHING
-            status.item_id = item_id
-            status.retries = 0
-            status.last_latency_ms = 0.0
-
-            start = time.monotonic()
-            item_json, retries = await fetch_item(session, item_id)
-            status.last_latency_ms = (time.monotonic() - start) * 1000.0
-            status.retries = retries
-            metrics.retries += retries
-
-            if item_json == "null":
-                status.state = STATE_SKIPPED
-                metrics.skipped += 1
-                metrics.completed += 1
-                continue
-
-            status.downloaded += 1
-            status.state = STATE_QUEUED
-            ack = asyncio.get_running_loop().create_future()
-            await write_queue.put((item_id, item_json, ack))
-            ok = await ack
-
-            if ok:
-                status.last_persisted_id = item_id
-                status.last_persisted_at = time.monotonic()
-                metrics.persisted += 1
-            else:
-                status.state = STATE_ERROR
-                status.last_error_at = time.monotonic()
-                metrics.errors += 1
-
-            metrics.completed += 1
-            status.state = STATE_IDLE
-        except Exception as e:
-            status.state = STATE_ERROR
-            status.last_error_at = time.monotonic()
-            metrics.errors += 1
-            logger.error(f"Worker {worker_id} failed on item {item_id}: {e}")
-        finally:
-            item_queue.task_done()
-
-
-async def run() -> None:
-    """
-    Main function to run the data dumper.
-    """
-    start_time = time.time()
-    max_id = 0
-    last_id = 0
-
-    # Create output directory if it doesn't exist
-    os.makedirs(os.path.dirname(DB_NAME) if os.path.dirname(DB_NAME) else ".", exist_ok=True)
-
-    try:
-        # Find the last ID we've processed
-        last_id = get_last_id(DB_NAME)
-
-        # Create TCP connector with keepalive to reuse connections
-        connector = aiohttp.TCPConnector(
-            limit=WORKER_COUNT,
-            ttl_dns_cache=300,
-            keepalive_timeout=60
-        )
-
-        # Create client session with retry options
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT)
-        async with aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
-            raise_for_status=False  # We'll handle status codes ourselves
-        ) as session:
-            # Get the current maximum item ID
-            max_id = await get_max_id(session)
-
-            items_to_download = max_id - last_id
-            if last_id > 0:
-                logger.info(f"Resuming from ID {last_id:,}")
-                logger.info(f"Max item ID: {max_id:,}")
-                logger.info(f"Items to download: {items_to_download:,}")
-            else:
-                logger.info(f"Starting fresh download of {max_id:,} items")
-
-            if items_to_download <= 0:
-                return
-
-            item_queue: asyncio.Queue = asyncio.Queue(maxsize=QUEUE_SIZE)
-            write_queue: asyncio.Queue = asyncio.Queue(maxsize=WRITE_QUEUE_SIZE)
-
-            statuses = [WorkerStatus() for _ in range(WORKER_COUNT)]
-            metrics = Metrics()
-            stop_ui = asyncio.Event()
-
-            writer_task = asyncio.create_task(
-                db_writer_worker(DB_NAME, write_queue)
-            )
-            ui_task = asyncio.create_task(
-                ui_loop(
-                    statuses,
-                    metrics,
-                    item_queue,
-                    write_queue,
-                    items_to_download,
-                    max_id,
-                    stop_ui
-                )
-            )
-            workers = [
-                asyncio.create_task(
-                    worker_loop(
-                        worker_id,
-                        session,
-                        item_queue,
-                        write_queue,
-                        statuses[worker_id],
-                        metrics
-                    )
-                )
-                for worker_id in range(WORKER_COUNT)
-            ]
-
-            try:
-                for item_id in range(last_id + 1, max_id + 1):
-                    await item_queue.put(item_id)
-                for _ in range(WORKER_COUNT):
-                    await item_queue.put(None)
-
-                await asyncio.gather(*workers)
-            finally:
-                await write_queue.put(None)
-                await writer_task
-                stop_ui.set()
-                await ui_task
-    finally:
-        elapsed = time.time() - start_time
-        items_processed = max_id - last_id
-
-        if items_processed > 0:
-            logger.info(f"Downloaded {items_processed:,} items in {elapsed:.2f} seconds")
-            logger.info(f"Average rate: {items_processed / elapsed:.2f} items/second")
-        else:
-            logger.info("No new items to download")
-
-
 def main() -> None:
-    """Main entry point for the script."""
-    try:
-        # Run the main async function
-        asyncio.run(run())
+    start_time = time.time()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info("Finished successfully")
-        
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-    except Exception as e:
-        logger.critical(f"Fatal error: {e}", exc_info=True)
+    stop_event = threading.Event()
+    report_done = threading.Event()
+
+    def handle_stop(signum: int, frame) -> None:
+        if not stop_event.is_set():
+            logger.info("Shutdown requested, stopping intake...")
+            stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handle_stop)
+        except ValueError:
+            pass
+
+    stats = Stats()
+    stats_lock = threading.Lock()
+
+    last_id, seen = scan_existing_ids(DB_PATH)
+
+    with requests.Session() as session:
+        max_id = get_max_id(session)
+
+    scan_limit = min(last_id, max_id)
+    missing_ids = find_missing_ids(seen, scan_limit)
+    missing_count = len(missing_ids)
+    items_to_download = max(0, max_id - last_id) + missing_count
+
+    if last_id > 0:
+        logger.info("Highest local ID: %s", f"{last_id:,}")
+        logger.info("Max item ID: %s", f"{max_id:,}")
+        if missing_count:
+            logger.info("Missing IDs to backfill: %s", f"{missing_count:,}")
+        logger.info("Items to download: %s", f"{items_to_download:,}")
+    else:
+        logger.info("Starting fresh download of %s items", f"{max_id:,}")
+
+    if items_to_download <= 0:
+        logger.info("No new items to download")
+        return
+
+    item_queue: queue.Queue = queue.Queue(maxsize=QUEUE_SIZE)
+    write_queue: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE_SIZE)
+
+    writer_thread = threading.Thread(
+        target=writer_loop,
+        args=(DB_PATH, write_queue, stats, stats_lock),
+        name="writer",
+    )
+    writer_thread.start()
+
+    workers = []
+    for worker_id in range(WORKER_COUNT):
+        thread = threading.Thread(
+            target=worker_loop,
+            args=(
+                worker_id,
+                item_queue,
+                write_queue,
+                stats,
+                stats_lock,
+                stop_event,
+            ),
+            name=f"worker-{worker_id}",
+        )
+        thread.start()
+        workers.append(thread)
+
+    reporter_thread = threading.Thread(
+        target=reporter_loop,
+        args=(
+            stats,
+            stats_lock,
+            item_queue,
+            write_queue,
+            items_to_download,
+            stop_event,
+            report_done,
+        ),
+        name="reporter",
+        daemon=True,
+    )
+    reporter_thread.start()
+
+    try:
+        if enqueue_ids(missing_ids, item_queue, stop_event):
+            enqueue_range(last_id + 1, max_id, item_queue, stop_event)
+    finally:
+        if stop_event.is_set():
+            dropped = 0
+            while True:
+                try:
+                    item_id = item_queue.get_nowait()
+                except queue.Empty:
+                    break
+                else:
+                    if item_id is not None:
+                        dropped += 1
+                    item_queue.task_done()
+            if dropped:
+                logger.info("Dropped %s queued IDs due to shutdown", dropped)
+
+        for _ in range(WORKER_COUNT):
+            item_queue.put(None)
+
+        for thread in workers:
+            thread.join()
+
+        write_queue.put(None)
+        writer_thread.join()
+
+        report_done.set()
+
+    elapsed = time.time() - start_time
+    final_stats = snapshot_stats(stats, stats_lock)
+    if items_to_download > 0:
+        logger.info(
+            "Downloaded %s/%s items in %.2f seconds",
+            f"{final_stats.persisted:,}",
+            f"{items_to_download:,}",
+            elapsed,
+        )
+        if elapsed > 0:
+            logger.info(
+                "Average rate: %.2f items/second",
+                final_stats.persisted / elapsed,
+            )
+    else:
+        logger.info("No new items to download")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+        logger.info("Finished successfully")
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    except Exception as e:
+        logger.critical("Fatal error: %s", e, exc_info=True)

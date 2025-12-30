@@ -21,7 +21,7 @@ chmod +x hn_async2.py
 ./hn_async2.py
 ```
 
-This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally as bucketed Parquet files under `data/`. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
+This will start downloading all items sequentially starting with id 1 to the current max from Firebase DB and store them locally as a Parquet file under `data/`. Once the initial download is finished, which can take a long time depending on your computer and network, subsequent runs only download the new items created since the last run so they finish quickly.
 
 
 ## Data Schema
@@ -31,7 +31,7 @@ Each Parquet file contains two columns:
 - `item_id` (integer)
 - `item_json` (JSON string)
 
-The files are written to `data/` with names like `hn-0000.parquet`, `hn-0001.parquet`, etc.
+The data is written to `data/hn.parquet`.
 
 Here is a sample of rows:
 ```
