@@ -39,6 +39,20 @@ You can read the Parquet file directly with [DuckDB](https://duckdb.org/). For e
 duckdb -c "SELECT json_extract_string(item_json, '\$.type') AS type, COUNT(*) AS count FROM 'data/hn-*.parquet' GROUP BY 1 ORDER BY 2 DESC;"
 ```
 
+Example result:
+```
+┌─────────┬──────────┐
+│  type   │  count   │
+│ varchar │  int64   │
+├─────────┼──────────┤
+│ comment │ 40481923 │
+│ story   │  5931222 │
+│ job     │    17976 │
+│ pollopt │    15395 │
+│ poll    │     2226 │
+└─────────┴──────────┘
+```
+
 If a shard is corrupted, the script will report the shard filename; delete it and re-run to rebuild that range.
 
 Here is a sample of rows:

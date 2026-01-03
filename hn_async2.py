@@ -166,47 +166,74 @@ def scan_existing_ids(
     max_id = 0
     corrupted_ranges: list[tuple[int, int]] = []
     corrupted_paths: list[Path] = []
+    progress: Optional[Progress] = None
+    task_id: Optional[int] = None
 
-    for start_id, end_id, path in shards:
-        try:
-            parquet = fastparquet.ParquetFile(str(path))
-        except Exception as e:
-            logger.error("Error opening shard %s: %s", path, e)
-            corrupted_ranges.append((start_id, end_id))
-            corrupted_paths.append(path)
-            continue
+    if sys.stdout.isatty():
+        console = Console()
+        progress = Progress(
+            SpinnerColumn(style="cyan"),
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(bar_width=None, complete_style="green"),
+            TaskProgressColumn(),
+            MofNCompleteColumn(),
+            TextColumn(" | "),
+            TimeElapsedColumn(),
+            console=console,
+        )
+        progress.start()
+        task_id = progress.add_task("Scanning shards", total=len(shards))
+    else:
+        logger.info("Scanning %s shard(s)...", f"{len(shards):,}")
 
-        local_ids: list[int] = []
-        local_max = 0
-        try:
-            for batch in parquet.iter_row_groups(columns=["item_id"]):
-                if batch.empty:
+    try:
+        for start_id, end_id, path in shards:
+            try:
+                try:
+                    parquet = fastparquet.ParquetFile(str(path))
+                except Exception as e:
+                    logger.error("Error opening shard %s: %s", path, e)
+                    corrupted_ranges.append((start_id, end_id))
+                    corrupted_paths.append(path)
                     continue
-                ids = batch["item_id"].tolist()
-                if not ids:
-                    continue
-                local_ids.extend(ids)
-                row_max = max(ids)
-                if row_max > local_max:
-                    local_max = row_max
-        except Exception as e:
-            logger.error("Error scanning shard %s: %s", path, e)
-            corrupted_ranges.append((start_id, end_id))
-            corrupted_paths.append(path)
-            continue
 
-        if local_ids:
-            if local_max >= len(seen):
-                new_size = max(local_max + 1, len(seen) * 2)
-                seen.extend(b"\x00" * (new_size - len(seen)))
-            for item_id in local_ids:
-                if item_id < 0:
+                local_ids: list[int] = []
+                local_max = 0
+                try:
+                    for batch in parquet.iter_row_groups(columns=["item_id"]):
+                        if batch.empty:
+                            continue
+                        ids = batch["item_id"].tolist()
+                        if not ids:
+                            continue
+                        local_ids.extend(ids)
+                        row_max = max(ids)
+                        if row_max > local_max:
+                            local_max = row_max
+                except Exception as e:
+                    logger.error("Error scanning shard %s: %s", path, e)
+                    corrupted_ranges.append((start_id, end_id))
+                    corrupted_paths.append(path)
                     continue
-                if item_id >= len(seen):
-                    seen.extend(b"\x00" * (item_id + 1 - len(seen)))
-                seen[item_id] = 1
-            if local_max > max_id:
-                max_id = local_max
+
+                if local_ids:
+                    if local_max >= len(seen):
+                        new_size = max(local_max + 1, len(seen) * 2)
+                        seen.extend(b"\x00" * (new_size - len(seen)))
+                    for item_id in local_ids:
+                        if item_id < 0:
+                            continue
+                        if item_id >= len(seen):
+                            seen.extend(b"\x00" * (item_id + 1 - len(seen)))
+                        seen[item_id] = 1
+                    if local_max > max_id:
+                        max_id = local_max
+            finally:
+                if progress is not None and task_id is not None:
+                    progress.update(task_id, advance=1)
+    finally:
+        if progress is not None:
+            progress.stop()
 
     if max_id + 1 < len(seen):
         seen = seen[: max_id + 1]
